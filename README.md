@@ -48,7 +48,7 @@ For detailed instructions on setup, usage, and architecture, please see our full
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/adeirman46/Chipster](https://github.com/adeirman46/Chipster)
+    git clone https://github.com/adeirman46/Chipster
     cd Chipster
     ```
 
