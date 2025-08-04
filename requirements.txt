@@ -48,3 +48,7 @@ bitsandbytes
 ipython
 sootty
 accelerate
+
+# Optional (Analog)
+pyspice
+schemdraw
