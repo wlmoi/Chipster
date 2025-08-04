@@ -44,3 +44,11 @@ matplotlib
 nest_asyncio
 langchain_google_genai
 langchain_community
+bitsandbytes
+ipython
+sootty
+accelerate
+
+# Optional (Analog)
+pyspice
+schemdraw

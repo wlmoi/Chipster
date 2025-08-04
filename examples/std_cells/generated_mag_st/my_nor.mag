@@ -1,0 +1,68 @@
+magic
+tech sky130A
+timestamp 1744208047
+<< locali >>
+rect 425 470 500 485
+rect 425 465 440 470
+rect 40 440 440 465
+rect 485 465 500 470
+rect 485 440 700 465
+rect 40 285 65 440
+rect 425 425 500 440
+rect -65 160 0 175
+rect -65 130 -50 160
+rect -15 135 135 160
+rect 560 155 615 170
+rect 490 135 570 155
+rect -15 130 0 135
+rect -65 115 0 130
+rect 560 130 570 135
+rect 605 130 615 155
+rect 290 -60 315 120
+rect 560 115 615 130
+rect 290 -85 735 -60
+rect 525 -140 610 -130
+rect 525 -170 540 -140
+rect 595 -170 610 -140
+rect 525 -185 610 -170
+rect 710 -85 735 -60
+<< viali >>
+rect 440 440 485 470
+rect -50 130 -15 160
+rect 570 130 605 155
+rect 540 -170 595 -140
+rect 710 -85 735 -60
+<< metal1 >>
+rect 425 470 500 485
+rect 425 440 440 470
+rect 485 440 500 470
+rect 425 425 500 440
+rect -65 160 0 175
+rect -65 130 -50 160
+rect -15 130 0 160
+rect -65 115 0 130
+rect 560 155 615 170
+rect 560 130 570 155
+rect 605 130 615 155
+rect 560 115 615 130
+rect 40 -135 65 15
+rect 560 -130 580 15
+rect 525 -135 610 -130
+rect 40 -140 700 -135
+rect 40 -155 540 -140
+rect 525 -170 540 -155
+rect 595 -155 700 -140
+rect 595 -170 610 -155
+rect 525 -185 610 -170
+rect 710 -85 735 -60
+use nor  nor_0 /foss/designs/eda/nor
+timestamp 1744208047
+transform 1 0 245 0 1 170
+box -245 -170 345 195
+<< labels >>
+rlabel viali 540 -170 595 -140 1 gnd
+rlabel viali -50 130 -15 160 1 in1
+rlabel viali 570 130 605 155 1 in2
+rlabel viali 440 440 485 470 1 vdd
+rlabel viali 710 -85 735 -60 1 out
+<< end >>
