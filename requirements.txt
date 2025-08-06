@@ -52,3 +52,15 @@ accelerate
 # Optional (Analog)
 pyspice
 schemdraw
+unstructured
+
+# Crawling data
+crawl4ai
+googlesearch-python
+nest_asyncio
+PyGithub
+langgraph
+pandas
+tqdm
+sentence-transformers
+langchain-huggingface

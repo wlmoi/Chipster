@@ -58,6 +58,8 @@ For detailed instructions on setup, usage, and architecture, please see our full
     conda create -n chipster_env python=3.11
     conda activate chipster_env
     pip install -r requirements.txt
+    crawl4ai-setup
+    crawl4ai-doctor
     ```
     Create .env file and enter your Gemini API.
     ```bash
