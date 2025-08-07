@@ -3,3 +3,10 @@ __pycache__
 train.ipynb
 data/verilog_datasets/verilog-instruct-deepseek-60k.csv
 faiss_verilog_db
+
+app2.py
+app3.py
+app3.5.py
+app4.py
+app0.py
+app4.1py

@@ -86,8 +86,6 @@ class GraphState(TypedDict):
     simulation_output: str
     error_count: int
     top_module_name: str
-    summary: str # New key for code summary
-    theory: str  # New key for theory explanation
 
 
 def get_graph_viz(active_node: str = None):
@@ -106,33 +104,16 @@ def get_graph_viz(active_node: str = None):
         "simulator": "7. Icarus Simulator",
         "check_simulation": "8. Check Results",
         "module_corrector": "9a. Module Corrector",
-        "testbench_corrector": "9b. Testbench Corrector",
-        "summarizer": "10. Code Summarizer",
-        "theory_researcher": "11. Theory Researcher"
+        "testbench_corrector": "9b. Testbench Corrector"
     }
     for name, label in nodes.items():
-        # Default styles for inactive nodes
-        node_shape = 'box'
-        node_style = 'rounded,filled'
-        fill_color = 'lightgrey'
-        font_color = 'black'
-
-        # Set specific colors for different types of inactive nodes
+        fillcolor = 'lightblue' if name == active_node else 'lightgrey'
+        fontcolor = "black"
         if "Corrector" in label:
-            fill_color = '#FFD2D2'  # Light red for correctors
+            fillcolor = 'lightcoral' if name == active_node else '#FFD2D2' # Reddish for correctors
         elif "Check" in label:
-            fill_color = 'moccasin'  # Light orange for the router
-        elif "Summarizer" in label or "Theory" in label:
-            fill_color = '#FFFACD'  # Light yellow for documentation
-        
-        # Override style for the currently active node
-        if name == active_node:
-            node_shape = 'square'
-            fill_color = 'yellow'
-            node_style = 'filled,bold'
-            font_color = 'black'
-
-        dot.node(name, label, shape=node_shape, style=node_style, fillcolor=fill_color, fontcolor=font_color)
+             fillcolor = 'orange' if name == active_node else 'moccasin' # Orange for router
+        dot.node(name, label, fillcolor=fillcolor, fontcolor=fontcolor)
 
     # Main flow
     dot.edge("dataset_retriever", "web_retriever")
@@ -143,22 +124,17 @@ def get_graph_viz(active_node: str = None):
     dot.edge("file_writer", "simulator")
     dot.edge("simulator", "check_simulation")
 
-    # Success Path
-    dot.edge("check_simulation", "summarizer", label="Success", color="green", style="bold")
-    dot.edge("summarizer", "theory_researcher")
-    
     # Add an END node for clarity
     dot.node("END", "🏁 END", shape="ellipse", style="filled", fillcolor="palegreen")
-    dot.edge("theory_researcher", "END")
-
 
     # Conditional Edges from Router
+    dot.edge("check_simulation", "END", label="Success", color="green", style="bold")
     dot.edge("check_simulation", "testbench_corrector", label="Fix Testbench", color="orange", style="dashed")
     dot.edge("check_simulation", "module_corrector", label="Fix Design", color="red", style="dashed")
 
     # Correction loop paths
     dot.edge("testbench_corrector", "file_writer", style="dashed")
-    dot.edge("module_corrector", "file_writer", style="dashed")
+    dot.edge("module_corrector", "file_writer", style="dashed") # CORRECTED FLOW
 
     return dot
 
@@ -578,8 +554,8 @@ def check_simulation_results_node(state):
     error_count = state.get("error_count", 0)
     
     if not simulation_output:
-        log.append("✅ Success! Routing to final documentation.")
-        return "success"
+        log.append("✅ Success! No errors found in simulation.")
+        return "end"
 
     log.append(f"⚠️ Error detected on attempt {error_count}.")
     if error_count >= MAX_RETRIES:
@@ -596,99 +572,6 @@ def check_simulation_results_node(state):
         log.append("Routing to: Module Corrector")
         return "fix_design"
 
-def summarizer_node(state):
-    """Summarizes the generated code."""
-    log = state.get("log", []) + ["\n--- AGENT: Code Summarizer ---"]
-    log.append("Generating code summary...")
-    
-    top_module_name = state["top_module_name"]
-    top_module_code = state["decomposed_files"].get(f"{top_module_name}.v", "")
-
-    if not top_module_code:
-        log.append("⚠️ Top module code not found for summarization.")
-        return {"summary": "Could not generate summary because the top-level module code was not found.", "log": log}
-
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0, google_api_key=GOOGLE_API_KEY)
-    prompt = ChatPromptTemplate.from_template(
-        """You are a technical writer specializing in hardware design documentation.
-        Based on the provided Verilog code for the top-level module, create a concise summary.
-
-        The summary should include:
-        1.  **Purpose**: A brief, one-sentence description of what the module does.
-        2.  **Inputs**: A list of all input ports with their bit widths.
-        3.  **Outputs**: A list of all output ports with their bit widths.
-        4.  **Functionality**: A short paragraph explaining the module's behavior.
-
-        **Top-Level Module Code (`{module_name}.v`):**
-        ```verilog
-        {module_code}
-        ```
-
-        **Your Summary:**
-        """
-    )
-    
-    chain = prompt | llm | StrOutputParser()
-    summary = chain.invoke({"module_name": top_module_name, "module_code": top_module_code})
-    
-    log.append("✅ Summary generated.")
-    return {"summary": summary, "log": log}
-
-async def theory_researcher_node_async(state):
-    """Researches the theoretical concept behind the user's query."""
-    log = state.get("log", []) + ["\n--- AGENT: Theory Researcher ---"]
-    query = state["query"]
-    log.append(f"Researching theory for: '{query}'...")
-
-    # Perform a web search for a high-level explanation
-    search_query = f"explain {query} digital logic design"
-    urls = list(search(search_query, num_results=1, lang="en"))
-
-    if not urls:
-        log.append("⚠️ No relevant theory explanation found on the web.")
-        return {"theory": "Could not find a relevant theoretical explanation for this topic.", "log": log}
-
-    # Crawl the top result
-    explanation_content = ""
-    async with AsyncWebCrawler() as crawler:
-        try:
-            result = await crawler.arun(url=urls[0])
-            if result and result.markdown:
-                explanation_content = result.markdown
-        except Exception as e:
-            log.append(f"⚠️ Failed to crawl {urls[0]}: {e}")
-            return {"theory": "Failed to retrieve information from the web.", "log": log}
-
-    if not explanation_content:
-        log.append("⚠️ Crawled page has no content.")
-        return {"theory": "Could not extract content from the web page.", "log": log}
-
-    # Summarize the content using an LLM
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0, google_api_key=GOOGLE_API_KEY)
-    prompt = ChatPromptTemplate.from_template(
-        """You are an expert in digital logic and computer architecture.
-        Based on the provided text from a webpage, write a concise and easy-to-understand explanation of the concept requested by the user.
-        Focus on the fundamental principles and common applications.
-
-        **User's Original Request:** {original_query}
-        **Content from Webpage:**
-        ```
-        {web_content}
-        ```
-
-        **Your Concise Explanation:**
-        """
-    )
-    chain = prompt | llm | StrOutputParser()
-    theory = chain.invoke({"original_query": query, "web_content": explanation_content})
-
-    log.append("✅ Theoretical explanation generated.")
-    return {"theory": theory, "log": log}
-
-def theory_researcher_node(state):
-    return asyncio.run(theory_researcher_node_async(state))
-
-
 # --- Graph Definition ---
 def build_graph():
     workflow = StateGraph(GraphState)
@@ -701,9 +584,6 @@ def build_graph():
     workflow.add_node("testbench_corrector", testbench_corrector_node)
     workflow.add_node("file_writer", file_writer_node)
     workflow.add_node("simulator", simulator_node)
-    workflow.add_node("summarizer", summarizer_node)
-    workflow.add_node("theory_researcher", theory_researcher_node)
-
 
     workflow.set_entry_point("dataset_retriever")
     workflow.add_edge("dataset_retriever", "web_retriever")
@@ -712,14 +592,9 @@ def build_graph():
     workflow.add_edge("decomposer", "testbench_generator")
     workflow.add_edge("testbench_generator", "file_writer")
     workflow.add_edge("file_writer", "simulator")
-    
-    # Add success path to new agents
-    workflow.add_edge("summarizer", "theory_researcher")
-    workflow.add_edge("theory_researcher", END)
-
 
     # Add correction loop edges
-    workflow.add_edge("module_corrector", "file_writer")
+    workflow.add_edge("module_corrector", "file_writer") # Corrected edge
     workflow.add_edge("testbench_corrector", "file_writer")
     
     # Add the conditional router
@@ -727,7 +602,6 @@ def build_graph():
         "simulator",
         check_simulation_results_node,
         {
-            "success": "summarizer",
             "fix_testbench": "testbench_corrector",
             "fix_design": "module_corrector",
             "end": END
@@ -756,7 +630,7 @@ if st.sidebar.button("✨ Generate & Verify Code", use_container_width=True):
         results_placeholder = col2.expander("Final Results & Files", expanded=True)
 
         graph_placeholder.graphviz_chart(get_graph_viz())
-        inputs = {"query": user_query, "error_count": 0, "summary": "", "theory": ""}
+        inputs = {"query": user_query, "error_count": 0}
         
         with st.spinner("Chipster Agent is thinking..."):
             final_result = None
@@ -783,15 +657,6 @@ if st.sidebar.button("✨ Generate & Verify Code", use_container_width=True):
                 st.balloons()
                 results_placeholder.success(f"✅ All Verilog files generated, verified, and saved to: `{final_result.get('output_path', 'N/A')}`")
             
-            # Display summary and theory if they exist
-            if final_result.get("summary"):
-                with results_placeholder.expander("📝 Code Summary", expanded=True):
-                    st.markdown(final_result["summary"])
-            
-            if final_result.get("theory"):
-                with results_placeholder.expander("🎓 Theory & Explanation", expanded=True):
-                    st.markdown(final_result["theory"])
-
             results_placeholder.write("---")
             results_placeholder.subheader("Generated Files & Content")
             if final_result.get("decomposed_files"):
