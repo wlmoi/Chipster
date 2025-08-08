@@ -1,572 +1,926 @@
 import streamlit as st
-import subprocess
 import os
-import json
-import shutil
+import glob
+import pandas as pd
+from typing import List, TypedDict, Dict
+import torch
 import re
-import uuid
-from IPython.display import SVG
-from sootty import WireTrace, Visualizer, Style
-import threading
+import json
+import graphviz
+import subprocess
 import difflib
+import base64
+
 from dotenv import load_dotenv
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+
+from langchain_community.document_loaders import CSVLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
-# --- Constants and Helper Functions ---
-HOME_DIR = os.path.expanduser("~")
-OPENLANE_DIR = os.path.join(HOME_DIR, "OpenLane")
-OPENLANE_IMAGE = "efabless/openlane:e73fb3c57e687a0023fcd4dcfd1566ecd478362a-amd64"
-PDK_ROOT = os.path.join(HOME_DIR, ".volare")
-GENERATED_VERILOG_DIR = "examples/verilog_designs"
+from langgraph.graph import StateGraph, END
 
-def clear_module_form():
-    """Resets the form fields to their default state for creating a new module."""
-    st.session_state.active_design_index = None
-    st.session_state.form_module_name = "my_module"
-    st.session_state.form_module_desc = "A simple module that passes input to output."
-    st.session_state.form_module_ports = []
-    st.session_state.form_module_params = []
-    st.session_state.form_module_is_toplevel = False
-    st.session_state.form_module_submodules = []
-    st.session_state.form_testbench_goal = "Test the main functionality with valid inputs."
-    st.session_state.form_test_vectors = []
-    st.rerun()
+# For the web agent
+import asyncio
+import nest_asyncio
+from crawl4ai import AsyncWebCrawler
+from googlesearch import search
+from langchain.docstore.document import Document
 
-def load_design_into_form(index):
-    """Loads an existing design's data into the form for editing."""
-    st.session_state.active_design_index = index
-    design = st.session_state.designs[index]
-    st.session_state.form_module_name = design.get('name', 'my_module')
-    st.session_state.form_module_desc = design.get('description', '')
-    st.session_state.form_module_ports = [p.copy() for p in design.get('ports', [])]
-    st.session_state.form_module_params = [p.copy() for p in design.get('params', [])]
-    st.session_state.form_module_is_toplevel = design.get('is_toplevel', False)
-    st.session_state.form_module_submodules = design.get('submodules', [])
-    st.session_state.form_testbench_goal = design.get('testbench_goal', "Test the main functionality with valid inputs.")
-    st.session_state.form_test_vectors = [v.copy() for v in design.get('test_vectors', [])]
-    st.session_state.show_correction_ui_sim = False
-    st.session_state.show_correction_ui_synth = False
-    st.rerun()
+# For Waveform visualization
+from sootty import WireTrace, Visualizer, Style
 
-def remove_design(index):
-    """Removes a design from the session state list."""
-    if st.session_state.active_design_index == index:
-        clear_module_form()
-    elif st.session_state.active_design_index is not None and st.session_state.active_design_index > index:
-        st.session_state.active_design_index -= 1
-    st.session_state.designs.pop(index)
-    st.rerun()
+# --- Configuration & Setup ---
 
-def get_port_range(bits_val):
-    """Generates the Verilog range string (e.g., [7:0]) from a bit width."""
-    bits_val_str = str(bits_val).strip()
-    if bits_val_str.isdigit() and int(bits_val_str) <= 1:
-        return ""
-    elif bits_val_str.isdigit():
-        return f"[{int(bits_val_str)-1}:0]"
+load_dotenv()
+nest_asyncio.apply()
+
+st.set_page_config(page_title="Chipster Agent", layout="wide")
+st.title("🤖 Chipster Agent: A Self-Correcting Verilog Designer")
+st.markdown("Powered by LangGraph and Gemini 2.5 Pro")
+
+try:
+    GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
+except KeyError:
+    st.error("🚨 GOOGLE_API_KEY not found! Please create a .env file with your key.")
+    st.stop()
+
+# --- Part 1: FAISS Index & Model Loading ---
+
+DATASET_PATH = "../../../data/verilog_datasets"
+INDEX_PATH_DATASET = os.path.join(DATASET_PATH, "faiss_verilog_db")
+INDEX_PATH_QFT = os.path.join(DATASET_PATH, "faiss_qft_verieval") # NEW: Path for the second index
+GENERATED_CODE_PATH = "../../../examples/verilog_designs"
+MAX_RETRIES = 10 # Maximum number of correction attempts
+
+@st.cache_resource
+def get_embedding_model():
+    """Loads the local HuggingFace embedding model, cached for performance."""
+    st.write("Loading Local Embedding Model (all-MiniLM-L6-v2)...")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    st.write(f"Using device: {device}")
+    return HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2', model_kwargs={'device': device})
+
+@st.cache_resource
+def load_dataset_vectorstore():
+    """Loads the main dataset FAISS index if it exists."""
+    if os.path.exists(INDEX_PATH_DATASET):
+        st.write(f"Loading existing dataset FAISS index from '{INDEX_PATH_DATASET}'...")
+        return FAISS.load_local(INDEX_PATH_DATASET, get_embedding_model(), allow_dangerous_deserialization=True)
     else:
-        return f"[{bits_val_str}-1:0]"
+        st.warning(f"Local dataset index not found at '{INDEX_PATH_DATASET}'. This data source will be skipped.")
+        return None
 
-def extract_verilog_code(raw_output, module_name=""):
-    """Extracts Verilog code from the LLM's raw output with robust fallbacks."""
-    verilog_matches = re.findall(r'```verilog(.*?)```', raw_output, re.DOTALL)
-    if not verilog_matches:
-        if 'module' in raw_output and 'endmodule' in raw_output:
-            st.warning("LLM did not use Markdown format. Extracting content between 'module' and 'endmodule'.")
-            match = re.search(r'module.*?endmodule', raw_output, re.DOTALL)
-            if match:
-                return match.group(0).strip()
-        return raw_output # Return raw output as a last resort
-    if len(verilog_matches) == 1:
-        return verilog_matches[0].strip()
-    if module_name:
-        for code_block in verilog_matches:
-            if re.search(rf'\bmodule\s+{re.escape(module_name)}\b', code_block):
-                return code_block.strip()
-    return max(verilog_matches, key=len).strip()
-
-class VerilogGenerator:
-    """Handles Verilog generation and correction using the Gemini Pro model."""
-    def __init__(self):
-        load_dotenv()
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables.")
-        
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=api_key, temperature=0.1)
-        
-        self.synthesis_chain = PromptTemplate.from_template(
-            "You are an expert Verilog designer. Generate clean, correct, and complete Verilog code based on the following prompt. "
-            "Only output the Verilog code itself, inside ```verilog ... ``` blocks. Do not add any explanations.\n\nPROMPT:\n{prompt}"
-        ) | self.llm | StrOutputParser()
-
-        self.improvement_chain = PromptTemplate.from_template(
-            "You are an expert Verilog designer and debugger. The user has provided Verilog code and an error log. "
-            "Analyze the error and provide a fully corrected version of the Verilog code for all specified modules. "
-            "Ensure the corrected code is complete and syntax-perfect. Only output the corrected code inside ```verilog ... ``` blocks, without any explanations.\n\n"
-            "USER'S PROMPT:\n{prompt}"
-        ) | self.llm | StrOutputParser()
-
-    def generate_code(self, prompt):
-        return self.synthesis_chain.invoke({"prompt": prompt})
-
-    def improve_code(self, prompt):
-        return self.improvement_chain.invoke({"prompt": prompt})
-
-def add_port():
-    """Callback to add a new port to the form's port list."""
-    name, bits = st.session_state.get("new_port_name", "").strip(), st.session_state.get("new_port_bits", "1").strip()
-    if name and bits:
-        st.session_state.form_module_ports.append({
-            "id": str(uuid.uuid4()), "direction": st.session_state.new_port_dir,
-            "type": st.session_state.new_port_type, "bits": bits, "name": name.replace(" ", "_")
-        })
-        st.session_state.new_port_name = ""
+@st.cache_resource
+def load_qft_vectorstore():
+    """Loads the QFT and VerilogEval FAISS index if it exists."""
+    if os.path.exists(INDEX_PATH_QFT):
+        st.write(f"Loading existing QFT/VeriEval FAISS index from '{INDEX_PATH_QFT}'...")
+        return FAISS.load_local(INDEX_PATH_QFT, get_embedding_model(), allow_dangerous_deserialization=True)
     else:
-        st.warning("Port Name and Bits/Param cannot be empty.")
+        st.warning(f"Local QFT index not found at '{INDEX_PATH_QFT}'. This data source will be skipped.")
+        return None
 
-def remove_port(port_id):
-    st.session_state.form_module_ports = [p for p in st.session_state.form_module_ports if p['id'] != port_id]
+db_verilog_dataset = load_dataset_vectorstore()
+db_qft_verieval = load_qft_vectorstore() # NEW: Load the second database
 
-def add_param():
-    name = st.session_state.get("new_param_name", "").strip()
-    if name:
-        st.session_state.form_module_params.append({
-            "id": str(uuid.uuid4()), "name": name.replace(" ", "_"), "value": st.session_state.new_param_value
-        })
-        st.session_state.new_param_name = ""
+
+# --- Part 2: LangGraph Multi-Agent Setup ---
+
+class GraphState(TypedDict):
+    query: str
+    log: List[str]
+    documents: List[Document]
+    generation: str
+    decomposed_files: Dict[str, str]
+    testbench_code: Dict[str, str]
+    output_path: str
+    simulation_output: str
+    error_count: int
+    top_module_name: str
+    summary: str
+    theory: str
+    waveform_svg: str
+
+
+def get_graph_viz(active_node: str = None):
+    """Generates a Graphviz object to visualize the agent workflow."""
+    dot = graphviz.Digraph(comment='Chipster Agent Workflow')
+    dot.attr('node', shape='box', style='rounded,filled', fillcolor='lightgrey')
+    dot.attr(rankdir='TB', splines='ortho')
+
+    nodes = {
+        "dataset_retriever": "1. Dataset Retriever",
+        "web_retriever": "2. Web Researcher",
+        "code_generator": "3. Verilog Generator",
+        "decomposer": "4. Decomposer & Header Extractor", # UPDATED
+        "testbench_generator": "5. Testbench Writer",
+        "file_writer": "6. File Writer",
+        "simulator": "7. Icarus Simulator",
+        "check_simulation": "8. Check Results",
+        "module_corrector": "9a. Module Corrector",
+        "testbench_corrector": "9b. Testbench Corrector",
+        "summarizer": "10. Code Summarizer",
+        "theory_researcher": "11. Theory Researcher",
+        "waveform_viewer": "12. Waveform Viewer"
+    }
+    for name, label in nodes.items():
+        if name == active_node:
+            dot.node(name, label, shape='square', style='filled,bold', fillcolor='#FFFF99', fontcolor='black') # Yellow highlight
+        else:
+            dot.node(name, label, shape='box', style='rounded,filled', fillcolor='#E0E0E0', fontcolor='black') # Light Grey
+
+    # Main flow
+    dot.edge("dataset_retriever", "web_retriever")
+    dot.edge("web_retriever", "code_generator")
+    dot.edge("code_generator", "decomposer")
+    dot.edge("decomposer", "testbench_generator")
+    dot.edge("testbench_generator", "file_writer")
+    dot.edge("file_writer", "simulator")
+    dot.edge("simulator", "check_simulation")
+
+    # Success Path
+    dot.edge("check_simulation", "summarizer", label="Success", color="green", style="bold")
+    dot.edge("summarizer", "theory_researcher")
+    dot.edge("theory_researcher", "waveform_viewer")
+     
+    # Add an END node for clarity
+    dot.node("END", "🏁 END", shape="ellipse", style="filled", fillcolor="palegreen")
+    dot.edge("waveform_viewer", "END")
+
+
+    # Conditional Edges from Router
+    dot.edge("check_simulation", "testbench_corrector", label="Fix Testbench", color="orange", style="dashed")
+    dot.edge("check_simulation", "module_corrector", label="Fix Design", color="red", style="dashed")
+
+    # Correction loop paths
+    dot.edge("testbench_corrector", "file_writer", style="dashed")
+    dot.edge("module_corrector", "file_writer", style="dashed")
+
+    return dot
+
+# --- Helper Functions ---
+def log_code_changes(log: List[str], filename: str, old_code: str, new_code: str) -> List[str]:
+    """Generates a diff and adds it to the log."""
+    diff = difflib.unified_diff(
+        old_code.splitlines(keepends=True),
+        new_code.splitlines(keepends=True),
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+    )
+    diff_str = "".join(diff)
+    if diff_str:
+        log.append(f"🔍 Code changes for `{filename}`:\n```diff\n{diff_str}```")
     else:
-        st.warning("Parameter name cannot be empty.")
+        log.append(f"🔍 No functional changes detected for `{filename}`.")
+    return log
 
-def remove_param(param_id):
-    st.session_state.form_module_params = [p for p in st.session_state.form_module_params if p['id'] != param_id]
+# --- Agent Nodes ---
 
-def add_test_vector():
-    vector = st.session_state.get("new_test_vector", "").strip()
-    if vector:
-        st.session_state.form_test_vectors.append({"id": str(uuid.uuid4()), "assignments": vector})
-        st.session_state.new_test_vector = ""
+def dataset_retriever_node(state):
+    query = state["query"]
+    log = state.get("log", []) + ["\n--- AGENT: Dataset Retriever ---"]
+    all_docs = []
+
+    # No change to this node, keeping it concise
+    if db_verilog_dataset:
+        docs1 = db_verilog_dataset.as_retriever(search_kwargs={"k": 10}).invoke(query)
+        all_docs.extend(docs1)
+        log.append(f"Found {len(docs1)} docs in 'faiss_verilog_db'.")
+    if db_qft_verieval:
+        docs2 = db_qft_verieval.as_retriever(search_kwargs={"k": 10}).invoke(query)
+        all_docs.extend(docs2)
+        log.append(f"Found {len(docs2)} docs in 'faiss_qft_verieval'.")
+     
+    log.append(f"Total documents retrieved from local DBs: {len(all_docs)}")
+    return {"documents": all_docs, "log": log}
+
+def web_retriever_node(state):
+    return asyncio.run(web_retriever_node_async(state))
+
+async def web_retriever_node_async(state):
+    """
+    UPDATED NODE: This node has an improved search and crawling strategy
+    to find more relevant Verilog code on GitHub.
+    """
+    query = state["query"]
+    existing_docs = state.get("documents", [])
+    log = state.get("log", []) + ["\n--- AGENT: Web Researcher ---"]
+    embeddings = get_embedding_model()
+    sanitized_prompt = re.sub(r'\W+', '_', query).lower()
+    index_name = f"faiss_github_{sanitized_prompt}"
+    INDEX_PATH_WEB = os.path.join(DATASET_PATH, index_name)
+    log.append(f"Checking for cached web index: '{INDEX_PATH_WEB}'")
+    web_vectorstore = None
+    if os.path.exists(INDEX_PATH_WEB):
+        log.append("✅ Cached index found! Loading.")
+        web_vectorstore = FAISS.load_local(INDEX_PATH_WEB, embeddings, allow_dangerous_deserialization=True)
     else:
-        st.warning("Test vector cannot be empty.")
+        log.append("❌ No cache. Searching and crawling web...")
 
-def remove_test_vector(vector_id):
-    st.session_state.form_test_vectors = [v for v in st.session_state.form_test_vectors if v['id'] != vector_id]
+        # --- IMPROVED SEARCH LOGIC ---
+        # Broader search query to find repositories and code
+        search_query = f'"{query}" verilog source code OR design files site:github.com'
+        log.append(f"Executing Google search with query: '{search_query}'")
+        # Increase search results to get more diverse code examples
+        urls = list(search(search_query, num_results=10, lang="en"))
+        log.append(f"Found {len(urls)} potential URLs from Google.")
+        # Log the first few URLs for debugging
+        for i, url in enumerate(urls[:5]):
+            log.append(f"  - URL {i+1}: {url}")
+        # --- END IMPROVEMENT ---
+
+        if not urls:
+             log.append("⚠️ No relevant URLs found on Google search.")
+             return {"documents": existing_docs, "log": log}
+
+        new_web_docs = []
+        crawled_count = 0
+        async with AsyncWebCrawler() as crawler:
+            # --- IMPROVED CRAWLING LOGIC ---
+            # Process all found URLs instead of just a subset
+            log.append(f"Crawling up to {len(urls)} URLs...")
+            for url in urls:
+                if url and "github.com" in url: # Ensure it's a GitHub link
+                    try:
+                        result = await crawler.arun(url=url)
+                        if result and result.markdown:
+                            # Add a check for code content to avoid empty READMEs
+                            if "```" in result.markdown or "module" in result.markdown or "input" in result.markdown:
+                                new_web_docs.append(Document(page_content=result.markdown, metadata={"source": url}))
+                                crawled_count += 1
+                                log.append(f"  - ✅ Successfully crawled: {url}")
+                            else:
+                                log.append(f"  - 🟡 Skipped (no code indicators): {url}")
+                        else:
+                            log.append(f"  - ⚠️ Crawled but no markdown content: {url}")
+                    except Exception as e:
+                        log.append(f"  - ❌ Failed to crawl {url}: {e}")
+            # --- END IMPROVEMENT ---
+
+        if new_web_docs:
+            log.append(f"Successfully extracted content from {crawled_count} URLs.")
+            split_docs = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200).split_documents(new_web_docs)
+            web_vectorstore = FAISS.from_documents(split_docs, embeddings)
+            web_vectorstore.save_local(INDEX_PATH_WEB)
+            log.append(f"✅ New web index saved with {len(split_docs)} document chunks.")
+        else:
+            log.append("Could not retrieve any valid documents from the web.")
+
+    docs_from_web = []
+    if web_vectorstore:
+        # Retrieve more documents to give the generator more context
+        retriever = web_vectorstore.as_retriever(search_kwargs={"k": 15}) # Increased k
+        docs_from_web = retriever.invoke(query)
+        log.append(f"✅ Retrieved {len(docs_from_web)} relevant document chunks from web cache for the query.")
+    else:
+        log.append("⚠️ No web vectorstore available to retrieve from.")
+
+    return {"documents": existing_docs + docs_from_web, "log": log}
+
+def code_generator_node(state):
+    query = state["query"]
+    documents = state["documents"]
+    log = state.get("log", []) + ["\n--- AGENT: Verilog Generator ---"]
+    log.append("✍️ Generating monolithic code from scratch...")
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+     
+    prompt_template = """You are an expert Verilog HDL designer.
+Based on the context from reference documents and the user's request, generate the complete, monolithic Verilog code.
+The code should be well-structured and include any necessary `define` macros or parameters at the top.
+Your output **MUST** be only the Verilog code, enclosed in a single markdown block. Do not include any other text.
+
+**CONTEXT:**
+{context}
+
+**REQUEST:**
+{question}
+
+**GENERATED VERILOG CODE:**
+```verilog
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+     
+    def format_docs(docs):
+        if not docs: return "No context documents found."
+        return "\n\n".join(f"Source: {doc.metadata.get('source', 'N/A')}\n\n{doc.page_content}" for doc in docs)
+         
+    rag_chain = ({"context": lambda x: format_docs(x["documents"]), "question": RunnablePassthrough()}| prompt | llm | StrOutputParser())
+    generation = rag_chain.invoke({"documents": documents, "question": query}).replace("```verilog", "").replace("```", "").strip()
+    log.append("✅ Monolithic code generated.")
+     
+    return {"generation": generation, "log": log, "simulation_output": ""}
+
+def module_corrector_node(state):
+    log = state.get("log", []) + ["\n--- AGENT: Verilog Module Corrector ---"]
+    log.append("♻️ Attempting to fix previous design error...")
+     
+    decomposed_files = state["decomposed_files"]
+    error_log = state["simulation_output"]
+     
+    # Improved logic to find the faulty file
+    faulty_filename = None
+    for fname in decomposed_files.keys():
+        # Icarus often reports errors with file:line format
+        if fname in error_log:
+            faulty_filename = fname
+            break
+     
+    if not faulty_filename:
+        log.append("⚠️ Could not identify a specific faulty module from the error log. No correction applied.")
+        return {"decomposed_files": decomposed_files, "log": log}
+
+    faulty_code = decomposed_files[faulty_filename]
+    log.append(f"Identified faulty file: `{faulty_filename}`")
+
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+     
+    prompt_template = """You are an expert Verilog debugger.
+**TASK:** You are given a single Verilog module that failed during simulation. Analyze the error message and the code, identify the bug, and provide a corrected version of **only that module's code**.
+Your output **MUST** be only the corrected Verilog code for the module, enclosed in a single markdown block.
+
+**FAULTY VERILOG MODULE (`{faulty_filename}`):**
+```verilog
+{faulty_code}
+```
+
+**SIMULATION ERROR LOG:**
+```
+{error_log}
+```
+
+**YOUR RESPONSE (Corrected, Complete Verilog Code for the Module Only):**
+```verilog
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm | StrOutputParser()
+     
+    corrected_module_code = chain.invoke({
+        "faulty_filename": faulty_filename,
+        "faulty_code": faulty_code,
+        "error_log": error_log
+    }).replace("```verilog", "").replace("```", "").strip()
+
+    updated_files = decomposed_files.copy()
+    updated_files[faulty_filename] = corrected_module_code
+    log.append(f"✅ Design correction generated for `{faulty_filename}`.")
+     
+    log = log_code_changes(log, faulty_filename, faulty_code, corrected_module_code)
+
+    return {"decomposed_files": updated_files, "log": log}
 
 
-def run():
-    """Main function to run the Streamlit UI for the Verilog Generator."""
-    st.header("Verilog Generation Workflow")
-    st.write("A multi-module workflow to generate, simulate, and synthesize digital designs.")
+def decomposer_node(state):
+    """
+    UPDATED NODE: This node now also extracts `define` macros and parameters
+    into a separate .vh header file and adds `include` statements where needed.
+    """
+    generation = state["generation"]
+    log = state.get("log", []) + ["\n--- AGENT: Decomposer & Header Extractor ---"]
+    log.append("Decomposing code and extracting headers...")
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0, google_api_key=GOOGLE_API_KEY)
+     
+    decomposer_prompt_template = """You are an expert Verilog refactoring tool.
+Your task is to analyze monolithic Verilog code and decompose it into multiple files.
+
+**RULES:**
+1.  Identify the top-level module.
+2.  Separate each `module` into its own file (e.g., `module_name.v`).
+3.  **Crucially: Identify all `` `define `` macros and shared `parameter` declarations. Move them into a single header file (e.g., `shared_header.vh`).**
+4.  In each `.v` file that uses a macro/parameter from the header, add the `` `include "shared_header.vh" `` directive at the top.
+5.  Return a single, valid JSON object with two keys: "top_module_name" and "files".
+6.  `files` must be an object where keys are filenames (`.v` or `.vh`) and values are the code content.
+7.  Your final output **MUST** be only the JSON object.
+
+**USER REQUEST:** {query}
+**MONOLITHIC VERILOG CODE:**
+```verilog
+{verilog_code}
+```
+
+**RESPONSE (Valid JSON object only):**
+"""
+    decomposer_prompt = ChatPromptTemplate.from_template(decomposer_prompt_template)
+     
+    chain = decomposer_prompt | llm | StrOutputParser()
+    response = chain.invoke({"verilog_code": generation, "query": state["query"]})
+     
+    try:
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if not json_match:
+            raise json.JSONDecodeError("No JSON object found in the LLM response.", response, 0)
+         
+        json_str = json_match.group(0)
+        parsed_json = json.loads(json_str)
+         
+        decomposed_files = parsed_json.get("files", {})
+        top_module_name = parsed_json.get("top_module_name", "")
+
+        if not decomposed_files or not top_module_name:
+             raise ValueError("Parsed JSON is missing 'files' or 'top_module_name' keys.")
+
+        log.append(f"✅ Decomposed into {len(decomposed_files)} files. Top module: `{top_module_name}`")
+        if any(".vh" in f for f in decomposed_files.keys()):
+            log.append("✅ Header file extracted successfully.")
+
+    except (json.JSONDecodeError, ValueError) as e:
+        log.append(f"❌ Failed to parse valid JSON from decomposer. Error: {e}. Falling back to monolithic code.")
+        log.append(f"   Raw LLM Response: {response}")
+        top_module_match = re.search(r'module\s+([\w#\(\)]+)', generation)
+        top_module_name = top_module_match.group(1).split('#')[0].strip() if top_module_match else "unknown_module"
+        decomposed_files = {f"{top_module_name}.v": generation}
+         
+    return {"decomposed_files": decomposed_files, "top_module_name": top_module_name, "log": log}
+
+def testbench_generator_node(state):
+    log = state.get("log", []) + ["\n--- AGENT: Testbench Writer ---"]
+    decomposed_files = state["decomposed_files"]
+    top_module_name = state["top_module_name"]
+
+    if not decomposed_files:
+        log.append("❌ Cannot generate testbench: No decomposed module files were provided.")
+        return {"testbench_code": {}, "log": log}
+
+    log.append("✍️ Generating new testbench...")
+    top_module_code = decomposed_files.get(f"{top_module_name}.v", list(decomposed_files.values())[0])
+    # Check if a header file exists to include it in the testbench
+    header_file = next((f for f in decomposed_files if f.endswith('.vh')), None)
+    header_include_line = f'- **Include the header file: `` `include "{header_file}" ``**' if header_file else ''
+
+
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+     
+    prompt_template = """You are an expert in Verilog testbench design.
+**TASK:** Write a comprehensive testbench for the provided top-level module.
+- The testbench module name **MUST** be `{top_module_name}_tb`.
+- Instantiate the DUT, provide realistic stimuli, and use `$display` or `$monitor` to show results.
+- It must include a clock signal if needed and terminate automatically using `$finish`.
+- **CRITICAL: You MUST include these two lines at the start of the initial block for waveform generation:**
+  `$dumpfile("design.vcd");`
+  `$dumpvars(0, {top_module_name}_tb);`
+{header_include}
+- Your final output **MUST** be a single, valid JSON object with one key-value pair: the key is the testbench filename (`{top_module_name}_tb.v`) and the value is the complete testbench code. **DO NOT** include the DUT's code in your response.
+
+**TOP-LEVEL MODULE CODE (for context only):**
+```verilog
+{top_module_code}
+```
+**RESPONSE (Valid JSON object containing only the testbench code):**
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+     
+    chain = prompt | llm | StrOutputParser()
+    response = chain.invoke({
+        "top_module_name": top_module_name,
+        "top_module_code": top_module_code,
+        "header_include": header_include_line
+    })
 
     try:
-        generator = VerilogGenerator()
+        json_str = response[response.find('{'):response.rfind('}')+1]
+        testbench_json = json.loads(json_str)
+        log.append(f"✅ Testbench generated: `{list(testbench_json.keys())[0]}`")
     except Exception as e:
-        st.error(f"💥 **Initialization Error:** {e}")
-        st.stop()
+        log.append(f"❌ Failed to generate valid testbench JSON. Error: {e}")
+        testbench_json = {}
+         
+    return {"testbench_code": testbench_json, "log": log}
 
-    # --- Session State Initialization ---
-    defaults = {
-        'designs': [], 'active_design_index': None, 'form_module_name': "my_module",
-        'form_module_desc': "A simple module that passes input to output.",
-        'form_module_ports': [], 'form_module_params': [], 'form_module_is_toplevel': False,
-        'form_module_submodules': [], 'form_testbench_goal': "Test the main functionality with valid inputs.",
-        'form_test_vectors': [], 'show_correction_ui_sim': False, 'show_correction_ui_synth': False,
-        'correction_prompt': "", 'suggested_code': "", 'suggested_tb': "",
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+def testbench_corrector_node(state):
+    log = state.get("log", []) + ["\n--- AGENT: Testbench Corrector ---"]
+    log.append("♻️ Attempting to fix previous testbench error...")
 
-    # --- Sidebar for Design Management ---
-    with st.sidebar:
-        st.header("Design Units")
-        st.button("➕ New Module", on_click=clear_module_form, use_container_width=True)
-        st.divider()
-        for i, design in enumerate(st.session_state.designs):
-            col1, col2 = st.columns([4, 1])
-            label = f"{design['name']}" + (" (Top)" if design.get('is_toplevel') else "")
-            col1.button(label, key=f"select_design_{i}", on_click=load_design_into_form, args=(i,), use_container_width=True, type="primary" if st.session_state.active_design_index == i else "secondary")
-            col2.button("🗑️", key=f"del_design_{i}", on_click=remove_design, args=(i,), use_container_width=True, help=f"Delete {design['name']}")
+    decomposed_files = state["decomposed_files"]
+    top_module_name = state["top_module_name"]
+    faulty_tb_code_dict = state["testbench_code"]
+    error_log = state["simulation_output"]
 
-    # --- Main Content Area ---
-    col1, col2 = st.columns([1, 1])
+    top_module_code = decomposed_files.get(f"{top_module_name}.v", list(decomposed_files.values())[0])
+    faulty_tb_filename = list(faulty_tb_code_dict.keys())[0] if faulty_tb_code_dict else f"{top_module_name}_tb.v"
+    faulty_tb_code = list(faulty_tb_code_dict.values())[0] if faulty_tb_code_dict else "# Faulty testbench code was not found"
 
-    with col1:
-        is_editing = st.session_state.active_design_index is not None
-        header_text = f"Editing: {st.session_state.form_module_name}" if is_editing else "1. Create a New Module"
-        st.header(header_text)
-        with st.expander("Expand to define the Verilog module", expanded=True):
-            st.text_input("Module Name", key="form_module_name")
-            st.checkbox("Set as Top-Level Module for Synthesis", key="form_module_is_toplevel")
-            available_modules = [d['name'] for i, d in enumerate(st.session_state.designs) if i != st.session_state.active_design_index]
-            st.multiselect("Instantiate existing modules:", options=available_modules, key="form_module_submodules")
-            st.text_area("Module Description", key="form_module_desc", help="Describe the desired functionality.")
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+     
+    prompt_template = """You are an expert Verilog testbench debugger.
+**TASK:** You are given a testbench that failed during simulation. Analyze the error message, the testbench code, and the module it is testing (DUT). Provide a corrected version of **only the testbench code**.
+- **CRITICAL: Ensure the corrected testbench includes `$dumpfile("design.vcd");` and `$dumpvars(0, {top_module_name}_tb);` for waveform generation.**
+- Your final output **MUST** be a single JSON object containing the corrected testbench. The key must be the original testbench filename.
 
-            st.subheader("A. Define Parameters")
-            param_cols = st.columns([2, 1, 1])
-            param_cols[0].text_input("Parameter Name", "", key="new_param_name")
-            param_cols[1].text_input("Default Value", "32", key="new_param_value")
-            param_cols[2].button("➕ Add Param", on_click=add_param, use_container_width=True)
-            for p in st.session_state.form_module_params:
-                p_col1, p_col2 = st.columns([5,1])
-                p_col1.markdown(f"- `parameter` **{p['name']}** = `{p['value']}`")
-                p_col2.button("🗑️", key=f"del_param_{p['id']}", on_click=remove_param, args=(p['id'],))
+**SIMULATION ERROR LOG:**
+```
+{error_log}
+```
 
-            st.subheader("B. Define Ports")
-            port_cols = st.columns([1, 1, 1, 2, 1])
-            port_cols[0].selectbox("Direction", ["input", "output"], key="new_port_dir")
-            port_cols[1].selectbox("Type", ["wire", "reg"], key="new_port_type")
-            port_cols[2].text_input("Bits/Param", "1", key="new_port_bits")
-            port_cols[3].text_input("Port Name", "", key="new_port_name")
-            port_cols[4].button("➕ Add Port", on_click=add_port, use_container_width=True)
-            for p in st.session_state.form_module_ports:
-                p_col1, p_col2 = st.columns([5,1])
-                range_str = get_port_range(p['bits'])
-                range_display = f" `{range_str}`" if range_str else ""
-                p_col1.markdown(f"- `{p['direction']}` `{p['type']}`{range_display} **{p['name']}**")
-                p_col2.button("🗑️", key=f"del_port_{p['id']}", on_click=remove_port, args=(p['id'],))
+**FAULTY TESTBENCH CODE (`{faulty_tb_filename}`):**
+```verilog
+{faulty_tb_code}
+```
 
-            st.divider()
-            button_text = "🚀 Update Verilog Module" if is_editing else "🚀 Generate Verilog Module"
-            if st.button(button_text, type="primary", use_container_width=True):
-                if not st.session_state.form_module_name.strip():
-                    st.error("Module name is required.")
-                else:
-                    with st.spinner("Generating Verilog with Gemini Pro..."):
-                        include_statements = "\n".join([f'`include "{name}.v"' for name in st.session_state.form_module_submodules])
-                        submodule_context = "This module must instantiate sub-modules. Use named port connections and parameter passing if needed.\n" if st.session_state.form_module_submodules else ""
-                        params = [f"parameter {p['name']} = {p['value']}" for p in st.session_state.form_module_params]
-                        param_defs_str = "#(\n    " + ",\n    ".join(params) + "\n)" if params else ""
-                        port_defs = ",\n".join([f"    {p['direction']} {'' if p['direction'] == 'input' else p['type']} {get_port_range(p['bits'])} {p['name']}" for p in st.session_state.form_module_ports])
-                        prompt = (f"Generate a Verilog module named '{st.session_state.form_module_name}'.\n{submodule_context}"
-                                  f"Functional Description: {st.session_state.form_module_desc}\nInstructions:\n"
-                                  f"1. If instantiating sub-modules, start with:\n{include_statements}\n\n"
-                                  f"2. Module definition:\nmodule {st.session_state.form_module_name} {param_defs_str}\n(\n{port_defs}\n);\n\nProvide the complete Verilog code.")
-                        
-                        raw_code = generator.generate_code(prompt)
-                        if raw_code:
-                            design_data = {
-                                "name": st.session_state.form_module_name.strip().replace(" ", "_"), "description": st.session_state.form_module_desc,
-                                "ports": [p.copy() for p in st.session_state.form_module_ports], "params": [p.copy() for p in st.session_state.form_module_params],
-                                "submodules": st.session_state.form_module_submodules, "code": extract_verilog_code(raw_code, st.session_state.form_module_name),
-                                "testbench": "", "is_toplevel": st.session_state.form_module_is_toplevel, "vcd_path": None, "sim_output": "", "openlane_config_str": "", "openlane_log": "",
-                                "testbench_goal": st.session_state.form_testbench_goal, "test_vectors": [v.copy() for v in st.session_state.form_test_vectors]
-                            }
-                            if design_data['is_toplevel']:
-                                for i, d in enumerate(st.session_state.designs):
-                                    if i != st.session_state.active_design_index:
-                                        d['is_toplevel'] = False
-                            if is_editing:
-                                st.session_state.designs[st.session_state.active_design_index] = design_data
-                                st.success(f"Module '{design_data['name']}' updated!")
-                            else:
-                                st.session_state.designs.append(design_data)
-                                st.session_state.active_design_index = len(st.session_state.designs) - 1
-                                st.success(f"Module '{design_data['name']}' generated!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to generate Verilog code.")
+**DEVICE UNDER TEST (DUT) CODE (`{top_module_name}.v`) (for context only):**
+```verilog
+{top_module_code}
+```
 
-    with col2:
-        if st.session_state.active_design_index is not None:
-            idx = st.session_state.active_design_index
-            active_design = st.session_state.designs[idx]
-            st.header(f"Workspace: {active_design['name']}")
-            tab1, tab2, tab3, tab4 = st.tabs(["📝 Verilog Code", "🔬 Testbench", "🏁 Simulation", "🛠️ Synthesis"])
+**RESPONSE (Valid JSON object containing only the corrected testbench code):**
+"""
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    chain = prompt | llm | StrOutputParser()
+     
+    response = chain.invoke({
+        "top_module_name": top_module_name,
+        "top_module_code": top_module_code,
+        "error_log": error_log,
+        "faulty_tb_filename": faulty_tb_filename,
+        "faulty_tb_code": faulty_tb_code
+    })
 
-            with tab1:
-                edited_code = st.text_area("RTL Code", value=active_design['code'], height=400, key=f"code_editor_{idx}")
-                if st.button("💾 Save Code", key=f"save_code_{idx}"):
-                    active_design['code'] = edited_code
-                    st.success("Verilog code saved!")
-                    st.toast("Saved!")
+    try:
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if not json_match:
+            raise json.JSONDecodeError("No JSON object found in the LLM response.", response, 0)
+         
+        json_str = json_match.group(0)
+        corrected_testbench_json = json.loads(json_str)
 
-            with tab2:
-                st.subheader("Testbench Configuration")
-                st.text_area("High-Level Goal", key="form_testbench_goal", help="Describe the overall testing objective.")
-                st.write("**Test Vectors**")
-                tv_cols = st.columns([4, 1])
-                tv_cols[0].text_input("Signal Assignments", placeholder="e.g., A=1; B=0; reset=1;", key="new_test_vector", label_visibility="collapsed")
-                tv_cols[1].button("➕ Add Vector", on_click=add_test_vector, use_container_width=True)
-                
-                for v in st.session_state.form_test_vectors:
-                    v_cols = st.columns([4, 1])
-                    v_cols[0].markdown(f"- `{v['assignments']}`")
-                    v_cols[1].button("🗑️", key=f"del_vec_{v['id']}", on_click=remove_test_vector, args=(v['id'],))
-                
-                st.divider()
+        if not isinstance(corrected_testbench_json, dict) or not corrected_testbench_json:
+            raise ValueError("Parsed JSON is not a valid, non-empty dictionary.")
+         
+        corrected_tb_filename = list(corrected_testbench_json.keys())[0]
+        corrected_tb_code = corrected_testbench_json[corrected_tb_filename]
 
-                if st.button("🤖 Generate Testbench", key=f"gen_tb_{idx}", type="primary", use_container_width=True):
-                    with st.spinner("Generating testbench with Gemini Pro..."):
-                        tb_module_name = f"{active_design['name']}_tb"
-                        param_declarations = "\n".join([f"    localparam {p['name']} = {p['value']};" for p in active_design.get('params', [])])
-                        signal_declarations = [f"    {'reg' if p['direction'] == 'input' else 'wire'} {get_port_range(p['bits'])} {p['name']};" for p in active_design.get('ports', [])]
-                        signal_declarations_str = "\n".join(signal_declarations)
-                        port_connections = ",\n".join([f"        .{p['name']}({p['name']})" for p in active_design.get('ports', [])])
-                        param_assignments = "#(\n" + ",\n".join([f"        .{p['name']}({p['name']})" for p in active_design.get('params', [])]) + "\n    )" if active_design.get('params') else ""
-                        dut_instantiation = f"""    {active_design['name']} {param_assignments} uut (\n{port_connections}\n    );"""
-                        vector_steps = [f"    // Step {i+1}\n    #10 {v['assignments']};" for i, v in enumerate(st.session_state.form_test_vectors)]
-                        vector_instructions = "\n".join(vector_steps)
-                        
-                        prompt = (
-                            f"""**Objective:** Generate a comprehensive and correct Verilog testbench.
-**Instructions:**
-1.  **MANDATORY:** The file MUST begin with `` `timescale 1ns/100ps` `` on the very first line.
-2.  The testbench module MUST be named `{tb_module_name}`.
-3.  Declare local parameters for the testbench like this:\n```verilog\n{param_declarations if param_declarations else "// No parameters to declare"}\n```
-4.  Declare `reg` and `wire` signals to connect to the DUT, like this:\n```verilog\n{signal_declarations_str}\n```
-5.  Instantiate the device under test (DUT), `{active_design['name']}`, using named port connections, like this:\n```verilog\n{dut_instantiation}\n```
-6.  **Clock Generation:** If a 'clk' signal exists, create a clock that toggles every 5ns. Use this exact code:\n    ```verilog\n    initial begin\n        clk = 0; // Initialize clock\n    end\n\n    always #5 clk = ~clk; // Toggle clock every 5ns\n    ```
-7.  **Stimulus:** Create an `initial begin...end` block for the main stimulus.
-    - Start by initializing all inputs to a known state (e.g., 0).
-    - If a 'reset' signal exists, assert it high then low at the beginning.
-    - Apply the following test vectors sequentially:\n    ```verilog\n    {vector_instructions if vector_instructions else "// No specific test vectors provided. Create a simple stimulus."}\n    ```
-8.  **VCD Dumping:** You MUST include this VCD generation block inside the testbench module:\n    ```verilog\n    initial begin\n      $dumpfile("{active_design['name']}.vcd");\n      $dumpvars(0, {tb_module_name});\n    end\n    ```
-9.  End the simulation with `$finish` after all stimulus has been applied.
-**DUT Code (for reference):**\n```verilog\n{active_design['code']}\n```\nProvide only the complete, clean Verilog code for the testbench.
-""")
-                        raw_tb = generator.generate_code(prompt)
-                        if raw_tb:
-                            active_design['testbench'] = extract_verilog_code(raw_tb, tb_module_name)
-                            active_design['testbench_goal'] = st.session_state.form_testbench_goal
-                            active_design['test_vectors'] = [v.copy() for v in st.session_state.form_test_vectors]
-                            st.success("Testbench generated!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to generate testbench.")
-                
-                st.subheader("Testbench Code")
-                edited_tb = st.text_area("Testbench Code", value=active_design.get('testbench', ''), height=400, key=f"tb_editor_{idx}", label_visibility="collapsed")
-                if st.button("💾 Save Testbench", key=f"save_tb_{idx}"):
-                    active_design['testbench'] = edited_tb
-                    st.success("Testbench code saved!")
-                    st.toast("Saved!")
+        log.append(f"✅ Testbench correction generated for: `{corrected_tb_filename}`")
+        log = log_code_changes(log, corrected_tb_filename, faulty_tb_code, corrected_tb_code)
 
-            with tab3:
-                st.subheader("RTL Simulation")
-                if st.button("🚦 Run Simulation", key=f"run_sim_{idx}", type="primary"):
-                    active_design['sim_output'], active_design['vcd_path'] = "", None
-                    
-                    module_dir = os.path.join(GENERATED_VERILOG_DIR, active_design['name'])
-                    os.makedirs(module_dir, exist_ok=True)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.append(f"❌ Failed to generate valid corrected testbench JSON. Error: {e}")
+        log.append(f"   Raw LLM Response: {response}")
+        corrected_testbench_json = faulty_tb_code_dict
+         
+    return {"testbench_code": corrected_testbench_json, "log": log}
 
-                    with st.spinner(f"Running Icarus Verilog simulation in '{module_dir}'..."):
-                        design_files_to_compile = []
-                        for d_name in active_design.get('submodules', []):
-                            sub_design = next((d for d in st.session_state.designs if d['name'] == d_name), None)
-                            if sub_design:
-                                file_path = os.path.join(module_dir, f"{d_name}.v")
-                                with open(file_path, "w") as f:
-                                    f.write(sub_design.get('code', ''))
-                                design_files_to_compile.append(f"{d_name}.v")
 
-                        main_design_path = os.path.join(module_dir, f"{active_design['name']}.v")
-                        with open(main_design_path, "w") as f:
-                            f.write(active_design.get('code', ''))
-                        design_files_to_compile.append(f"{active_design['name']}.v")
-                        
-                        tb_file_path = os.path.join(module_dir, f"{active_design['name']}_tb.v")
-                        with open(tb_file_path, "w") as f:
-                            f.write(active_design.get('testbench', ''))
-                        
-                        output_file = f"{active_design['name']}_sim"
-                        vcd_file = f"{active_design['name']}.vcd"
-                        
-                        try:
-                            compile_cmd = ["iverilog", "-o", output_file, f"{active_design['name']}_tb.v"] + list(set(design_files_to_compile))
-                            compile_res = subprocess.run(compile_cmd, capture_output=True, text=True, cwd=module_dir)
-                            if compile_res.returncode != 0:
-                                raise subprocess.CalledProcessError(compile_res.returncode, compile_cmd, stderr=compile_res.stderr)
-                            
-                            run_res = subprocess.run(["vvp", output_file], capture_output=True, text=True, check=True, cwd=module_dir)
-                            active_design['sim_output'] = f"Compilation:\n{compile_res.stdout}{compile_res.stderr}\n\nExecution:\n{run_res.stdout}{run_res.stderr}"
-                            
-                            vcd_path_abs = os.path.join(module_dir, vcd_file)
-                            if os.path.exists(vcd_path_abs):
-                                st.success("Simulation successful!")
-                                active_design['vcd_path'] = vcd_path_abs
-                            else:
-                                st.warning("Simulation ran, but VCD file was not found.")
-                        except subprocess.CalledProcessError as e:
-                            st.error("Error during simulation:")
-                            active_design['sim_output'] = e.stderr
-                        except Exception as e:
-                            st.error(f"An unexpected error occurred: {e}")
-                    st.rerun()
+def file_writer_node(state):
+    log = state.get("log", []) + ["\n--- AGENT: File Writer ---"]
+    query = state["query"]
+    decomposed_files = state["decomposed_files"]
+    testbench_code = state.get("testbench_code", {})
+    sanitized_prompt = re.sub(r'\W+', '_', query).lower()
+    output_path = os.path.join(GENERATED_CODE_PATH, f"generated_{sanitized_prompt}")
+    os.makedirs(output_path, exist_ok=True)
+    log.append(f"Writing files to: `{output_path}`")
 
-                if active_design.get('sim_output'):
-                    st.code(active_design['sim_output'], language='log')
-                    if "error" in active_design.get('sim_output', "").lower() and not st.session_state.show_correction_ui_sim:
-                        if st.button("🤖 Correct Simulation Error", key=f"start_correct_sim_{idx}"):
-                            st.session_state.show_correction_ui_sim = True
-                            st.session_state.correction_prompt = (
-                                f"The Verilog simulation failed. Analyze the error log and the source code, then provide a complete, corrected version of the module and/or the testbench that fixes the error.\n\n"
-                                f"**Error Log:**\n```\n{active_design['sim_output']}\n```\n\n"
-                                f"**Original Module Code (`{active_design['name']}.v`):**\n```verilog\n{active_design['code']}\n```\n\n"
-                                f"**Original Testbench Code (`{active_design['name']}_tb.v`):**\n```verilog\n{active_design['testbench']}\n```\n\n"
-                                f"Your goal is to fix the bug so the simulation can run successfully. Provide the full code for any file you change."
-                            )
-                            st.rerun()
-
-                if st.session_state.show_correction_ui_sim:
-                    with st.expander("🛠️ Simulation Correction Workspace", expanded=True):
-                        st.text_area("LLM Correction Prompt", key="correction_prompt", height=250)
-                        if st.button("🤖 Generate Fix", key="generate_fix_btn_sim"):
-                            with st.spinner("Asking Gemini Pro for a fix..."):
-                                full_response = generator.improve_code(st.session_state.correction_prompt)
-                                if full_response:
-                                    st.session_state.suggested_code = extract_verilog_code(full_response, active_design['name'])
-                                    st.session_state.suggested_tb = extract_verilog_code(full_response, f"{active_design['name']}_tb")
-                                else:
-                                    st.error("LLM failed to provide a correction.")
-                            st.rerun()
-
-                        if st.session_state.suggested_code or st.session_state.suggested_tb:
-                            st.write("#### Proposed Changes")
-                            if st.session_state.suggested_code:
-                                st.write(f"**Module: `{active_design['name']}.v`**")
-                                diff = difflib.unified_diff(active_design['code'].splitlines(keepends=True), st.session_state.suggested_code.splitlines(keepends=True), fromfile='Original', tofile='Suggested')
-                                st.code("".join(diff), language='diff')
-                            if st.session_state.suggested_tb:
-                                st.write(f"**Testbench: `{active_design['name']}_tb.v`**")
-                                diff_tb = difflib.unified_diff(active_design['testbench'].splitlines(keepends=True), st.session_state.suggested_tb.splitlines(keepends=True), fromfile='Original', tofile='Suggested')
-                                st.code("".join(diff_tb), language='diff')
-
-                            c1, c2 = st.columns(2)
-                            if c1.button("✅ Accept Changes", use_container_width=True, key="accept_sim_changes"):
-                                if st.session_state.suggested_code: active_design['code'] = st.session_state.suggested_code
-                                if st.session_state.suggested_tb: active_design['testbench'] = st.session_state.suggested_tb
-                                st.session_state.show_correction_ui_sim = False
-                                st.success("Code updated with accepted changes.")
-                                st.rerun()
-                            if c2.button("❌ Reject Changes", use_container_width=True, key="reject_sim_changes"):
-                                st.session_state.show_correction_ui_sim = False
-                                st.rerun()
-
-                if active_design.get('vcd_path'):
-                    st.subheader("Waveform Viewer")
-                    if st.button("📈 Show Waveform", key=f"show_wave_{idx}"):
-                        with st.spinner("Generating waveform image..."):
-                            try:
-                                wiretrace = WireTrace.from_vcd(active_design['vcd_path'])
-                                image = Visualizer(Style.Dark).to_svg(wiretrace, start=0, length=1000)
-                                st.image(str(image))
-                            except Exception as e:
-                                st.error(f"Failed to display waveform: {e}")
-
-            with tab4:
-                st.subheader("Synthesize with OpenLane")
-                st.warning("Prerequisites: Docker, OpenLane, and SKY130 PDK must be installed.", icon="⚠️")
-                top_level_design = next((d for d in st.session_state.designs if d.get('is_toplevel')), None)
-                if not top_level_design:
-                    st.error("No top-level module designated. Please set one.")
-                else:
-                    st.info(f"Top-level module for synthesis: **{top_level_design['name']}**")
-                    if not active_design.get('openlane_config_str'):
-                        module_dir = os.path.join(GENERATED_VERILOG_DIR, active_design['name'])
-                        all_verilog_files = [os.path.join(module_dir, f"{d['name']}.v") for d in st.session_state.designs]
-                        active_design['openlane_config_str'] = json.dumps({
-                            "DESIGN_NAME": top_level_design['name'], "VERILOG_FILES": list(set(all_verilog_files)),
-                            "CLOCK_PORT": "clk", "CLOCK_PERIOD": 10.0,  "DESIGN_IS_CORE": "false", "FP_PDN_CORE_RING": "false", "RT_MAX_LAYER": "met4"
-                        }, indent=4)
-                    
-                    edited_config_str = st.text_area("OpenLane Configuration (config.json)", value=active_design['openlane_config_str'], height=250, key=f"json_editor_{idx}")
-                    if st.button("💾 Save Config", key=f"save_json_{idx}"):
-                        active_design['openlane_config_str'] = edited_config_str
-                        st.success("OpenLane config saved!")
-                        st.toast("Saved!")
-
-                    if st.button("🛠️ Synthesize Chip", key=f"synth_{idx}", type="primary"):
-                        try:
-                            user_config = json.loads(active_design['openlane_config_str'])
-                            design_name = user_config["DESIGN_NAME"]
-                            design_dir = os.path.join(OPENLANE_DIR, "designs", design_name)
-                            if os.path.exists(design_dir):
-                                shutil.rmtree(design_dir)
-                            os.makedirs(os.path.join(design_dir, "src"), exist_ok=True)
-                            with open(os.path.join(design_dir, "config.json"), "w") as f:
-                                json.dump(user_config, f, indent=4)
-                            for d in st.session_state.designs:
-                                with open(os.path.join(design_dir, "src", f"{d['name']}.v"), "w") as f:
-                                    f.write(d['code'])
-                            st.success(f"Set up design '{design_name}' in '{design_dir}'.")
-                            docker_command = ['docker', 'run', '--rm', '-v', f'{HOME_DIR}:{HOME_DIR}', '-v', f'{OPENLANE_DIR}:/openlane', '-e', f'PDK_ROOT={PDK_ROOT}', '-e', 'PDK=sky130A', '--user', f'{os.getuid()}:{os.getgid()}', OPENLANE_IMAGE, './flow.tcl', '-design', design_name]
-                            st.info("Running OpenLane flow..."); st.code(' '.join(docker_command))
-                            log_placeholder, log_content = st.empty(), ""
-                            process = subprocess.Popen(docker_command, cwd=OPENLANE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-                            for line in iter(process.stdout.readline, ''):
-                                log_content += line
-                                log_placeholder.code(log_content, language='log')
-                            process.stdout.close()
-                            active_design['openlane_log'] = log_content
-                            if process.wait() == 0:
-                                st.success(f"✅ OpenLane flow for {design_name} completed!")
-                            else:
-                                st.error(f"❌ OpenLane flow failed. Check logs.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"An error occurred during synthesis setup: {e}")
-
-                    if active_design.get('openlane_log'):
-                        st.code(active_design.get('openlane_log'), language='log')
-                        if "error" in active_design.get('openlane_log', "").lower() and not st.session_state.show_correction_ui_synth:
-                            if st.button("🤖 Correct Synthesis Error", key=f"start_correct_synth_{idx}"):
-                                st.session_state.show_correction_ui_synth = True
-                                all_designs_code = ""
-                                for d in st.session_state.designs:
-                                    all_designs_code += f"\n--- Verilog for {d['name']} ---\n```verilog\n{d['code']}\n```\n"
-                                
-                                log_lines = active_design.get('openlane_log', '').splitlines()[-50:]
-                                log_for_prompt = "\n".join(log_lines)
-                                
-                                st.session_state.correction_prompt = (
-                                    f"The OpenLane synthesis flow failed for top-level design '{top_level_design['name']}'. Analyze the error log and all provided Verilog files, then provide a complete, corrected version of ONLY the file(s) that need to be fixed.\n\n"
-                                    f"**Error Log (last 50 lines):**\n```\n{log_for_prompt}\n```\n\n"
-                                    f"**All Verilog Modules in Project:**\n{all_designs_code}\n\n"
-                                    f"Your goal is to fix the bug so the synthesis can run successfully. Provide the full code for any file you change."
-                                )
-                                st.rerun()
-
-                    if st.session_state.show_correction_ui_synth:
-                        with st.expander("🛠️ Synthesis Correction Workspace", expanded=True):
-                            st.text_area("LLM Correction Prompt", key="correction_prompt", height=300)
-                            if st.button("🤖 Generate Fix", key="generate_fix_btn_synth"):
-                                with st.spinner("Asking Gemini Pro for a fix..."):
-                                    full_response = generator.improve_code(st.session_state.correction_prompt)
-                                    if full_response:
-                                        st.session_state.suggested_code = full_response
-                                    else:
-                                        st.error("LLM failed to provide a correction.")
-                                st.rerun()
-
-                            if st.session_state.suggested_code:
-                                st.write("#### Proposed Changes")
-                                any_change_found = False
-                                for design in st.session_state.designs:
-                                    suggested_module_code = extract_verilog_code(st.session_state.suggested_code, design['name'])
-                                    if suggested_module_code:
-                                        any_change_found = True
-                                        st.write(f"**Module: `{design['name']}.v`**")
-                                        diff = difflib.unified_diff(design['code'].splitlines(keepends=True), suggested_module_code.splitlines(keepends=True), fromfile='Original', tofile='Suggested')
-                                        st.code("".join(diff), language='diff')
-                                
-                                if not any_change_found:
-                                    st.warning("The LLM provided a response, but I couldn't match it to any of your existing modules. Here is the raw response:")
-                                    st.code(st.session_state.suggested_code)
-
-                                c1, c2 = st.columns(2)
-                                if c1.button("✅ Accept Changes", use_container_width=True, key="accept_synth_changes", disabled=not any_change_found):
-                                    for design in st.session_state.designs:
-                                        suggested_module_code = extract_verilog_code(st.session_state.suggested_code, design['name'])
-                                        if suggested_module_code:
-                                            design['code'] = suggested_module_code
-                                    st.session_state.show_correction_ui_synth = False
-                                    st.success("Code updated with accepted changes.")
-                                    st.rerun()
-                                if c2.button("❌ Reject Changes", use_container_width=True, key="reject_synth_changes"):
-                                    st.session_state.show_correction_ui_synth = False
-                                    st.rerun()
+    all_files_to_write = {**decomposed_files, **testbench_code}
+    for filename, content in all_files_to_write.items():
+        # Sanitize filename just in case
+        safe_filename = re.sub(r'[^\w\.\-]', '_', filename)
+        if isinstance(content, str) and content.strip():
+            with open(os.path.join(output_path, safe_filename), 'w') as f:
+                f.write(content)
+            log.append(f"  - Wrote `{safe_filename}`")
         else:
-            st.info("Select a design unit from the sidebar or create a new one to begin.")
+            log.append(f"  - ⚠️ Skipped writing `{safe_filename}` due to invalid content.")
+             
+    return {"output_path": output_path, "log": log}
+
+def simulator_node(state):
+    """
+    UPDATED NODE: Runs simulation inside the output directory to ensure
+    VCD files are generated in the correct location.
+    """
+    log = state.get("log", []) + ["\n--- AGENT: Icarus Simulator ---"]
+    output_path = state["output_path"]
+    log.append(f"Preparing to simulate files in `{output_path}`")
+
+    # Get relative paths for the commands to be run inside the output_path
+    verilog_filenames = [os.path.basename(f) for f in glob.glob(os.path.join(output_path, "*.v"))]
+    if not verilog_filenames:
+        log.append("❌ No `.v` files found to simulate.")
+        return {"simulation_output": "Error: No Verilog files found.", "log": log}
+     
+    output_vvp_filename = "design.vvp"
+    # Command uses relative filenames now
+    command = ["iverilog", "-o", output_vvp_filename] + verilog_filenames
+     
+    simulation_output = ""
+    try:
+        log.append(f"Running compilation in `{output_path}`...")
+        log.append(f"Command: `{' '.join(command)}`")
+        # Run compilation from within the output directory
+        compile_process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=output_path # Change working directory
+        )
+         
+        if compile_process.returncode != 0:
+            raise subprocess.CalledProcessError(compile_process.returncode, compile_process.args, output=compile_process.stdout, stderr=compile_process.stderr)
+             
+        log.append("✅ Compilation successful.")
+         
+        # Command for simulation now just needs the relative filename
+        sim_command = ["vvp", output_vvp_filename]
+        log.append(f"Running simulation in `{output_path}`...")
+        log.append(f"Command: `{' '.join(sim_command)}`")
+        # Run simulation from within the output directory
+        sim_process = subprocess.run(
+            sim_command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+            cwd=output_path # Change working directory
+        )
+        simulation_output = sim_process.stdout
+        log.append("✅ Simulation finished.")
+         
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr or e.stdout or "Unknown simulation error."
+        simulation_output = f"ERROR during {'compilation' if 'iverilog' in ' '.join(e.cmd) else 'simulation'}:\n{error_message}"
+        log.append(f"❌ Simulation Failed.")
+    except subprocess.TimeoutExpired:
+        simulation_output = "ERROR: Simulation timed out. The testbench may have an infinite loop or is not finishing with `$finish`."
+        log.append(f"❌ {simulation_output}")
+
+    # Clear simulation output on success, keep it on error
+    if "ERROR" not in simulation_output:
+        return {"simulation_output": "", "log": log}
+    else:
+        error_count = state.get("error_count", 0) + 1
+        return {"simulation_output": simulation_output, "error_count": error_count, "log": log}
+
+
+def check_simulation_results_node(state):
+    log = state.get("log", []) + ["\n--- ROUTER: Checking Results ---"]
+    simulation_output = state.get("simulation_output", "")
+    error_count = state.get("error_count", 0)
+     
+    if not simulation_output:
+        log.append("✅ Success! Routing to final documentation.")
+        return "success"
+
+    log.append(f"⚠️ Error detected on attempt {error_count + 1}.")
+    if error_count >= MAX_RETRIES:
+        log.append(f"❌ Maximum retry limit ({MAX_RETRIES}) reached. Halting workflow.")
+        return "end"
+     
+    tb_files = [f for f in state.get("testbench_code", {}).keys()]
+    is_tb_error = any(tb_file in simulation_output for tb_file in tb_files if tb_file) or "timeout" in simulation_output.lower()
+
+    if is_tb_error:
+        log.append("Routing to: Testbench Corrector")
+        return "fix_testbench"
+    else:
+        log.append("Routing to: Module Corrector")
+        return "fix_design"
+
+def summarizer_node(state):
+    log = state.get("log", []) + ["\n--- AGENT: Code Summarizer ---"]
+    log.append("Generating code summary...")
+     
+    top_module_name = state["top_module_name"]
+    top_module_code = state["decomposed_files"].get(f"{top_module_name}.v", "")
+
+    if not top_module_code:
+        log.append("⚠️ Top module code not found for summarization.")
+        return {"summary": "Could not generate summary because the top-level module code was not found.", "log": log}
+
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0, google_api_key=GOOGLE_API_KEY)
+    prompt = ChatPromptTemplate.from_template(
+        """You are a technical writer for hardware design. Based on the Verilog code, create a concise summary.
+        Include:
+        1.  **Purpose**: One sentence on what the module does.
+        2.  **Ports**: Lists of input and output ports with bit widths.
+        3.  **Functionality**: A short paragraph on its behavior.
+
+        **Top-Level Module Code (`{module_name}.v`):**
+        ```verilog
+        {module_code}
+        ```
+        **Your Summary:**
+        """
+    )
+     
+    chain = prompt | llm | StrOutputParser()
+    summary = chain.invoke({"module_name": top_module_name, "module_code": top_module_code})
+     
+    log.append("✅ Summary generated.")
+    return {"summary": summary, "log": log}
+
+async def theory_researcher_node_async(state):
+    log = state.get("log", []) + ["\n--- AGENT: Theory Researcher ---"]
+    query = state["query"]
+    log.append(f"Researching theory for: '{query}'...")
+
+    search_query = f"explain {query} digital logic design"
+    urls = list(search(search_query, num_results=1, lang="en"))
+
+    if not urls:
+        log.append("⚠️ No relevant theory explanation found on the web.")
+        return {"theory": "Could not find a relevant theoretical explanation for this topic.", "log": log}
+
+    explanation_content = ""
+    async with AsyncWebCrawler() as crawler:
+        if urls[0]:
+            try:
+                result = await crawler.arun(url=urls[0])
+                if result and result.markdown:
+                    explanation_content = result.markdown
+            except Exception as e:
+                log.append(f"⚠️ Failed to crawl {urls[0]}: {e}")
+                return {"theory": "Failed to retrieve information from the web.", "log": log}
+
+    if not explanation_content:
+        log.append("⚠️ Crawled page has no content.")
+        return {"theory": "Could not extract content from the web page.", "log": log}
+
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.0, google_api_key=GOOGLE_API_KEY)
+    prompt = ChatPromptTemplate.from_template(
+        """You are an expert in digital logic. Based on the text provided, write a concise explanation of the concept requested by the user.
+        Focus on fundamental principles.
+
+        **User's Request:** {original_query}
+        **Content from Webpage:**
+        ```
+        {web_content}
+        ```
+        **Your Concise Explanation:**
+        """
+    )
+    chain = prompt | llm | StrOutputParser()
+    theory = chain.invoke({"original_query": query, "web_content": explanation_content})
+
+    log.append("✅ Theoretical explanation generated.")
+    return {"theory": theory, "log": log}
+
+def theory_researcher_node(state):
+    return asyncio.run(theory_researcher_node_async(state))
+
+def waveform_viewer_node(state):
+    """Generates an SVG waveform from the VCD file using Sootty."""
+    log = state.get("log", []) + ["\n--- AGENT: Waveform Viewer ---"]
+    output_path = state["output_path"]
+    vcd_path = os.path.join(output_path, "design.vcd")
+     
+    log.append(f"Looking for VCD file at: `{vcd_path}`")
+
+    if not os.path.exists(vcd_path) or os.path.getsize(vcd_path) == 0:
+        log.append("⚠️ VCD file not found or is empty. Skipping waveform generation.")
+        return {"waveform_svg": "", "log": log}
+         
+    log.append("✅ Found VCD file. Generating waveform image with Sootty...")
+     
+    try:
+        wiretrace = WireTrace.from_vcd(vcd_path)
+        # Render all wires for a comprehensive view
+        wires_to_render = wiretrace.get_wires()
+        image = Visualizer(Style.Dark).to_svg(wiretrace, start=0, length=2000, wires=wires_to_render)
+        # Convert SVG object to a base64 encoded string for reliable display
+        svg_string = image.decode('utf-8')
+        log.append("✅ Waveform SVG generated successfully.")
+        return {"waveform_svg": svg_string, "log": log}
+    except Exception as e:
+        log.append(f"❌ Failed to generate waveform with Sootty: {e}")
+        return {"waveform_svg": "", "log": log}
+
+# --- Graph Definition ---
+def build_graph():
+    workflow = StateGraph(GraphState)
+    workflow.add_node("dataset_retriever", dataset_retriever_node)
+    workflow.add_node("web_retriever", web_retriever_node)
+    workflow.add_node("code_generator", code_generator_node)
+    workflow.add_node("module_corrector", module_corrector_node)
+    workflow.add_node("decomposer", decomposer_node)
+    workflow.add_node("testbench_generator", testbench_generator_node)
+    workflow.add_node("testbench_corrector", testbench_corrector_node)
+    workflow.add_node("file_writer", file_writer_node)
+    workflow.add_node("simulator", simulator_node)
+    workflow.add_node("summarizer", summarizer_node)
+    workflow.add_node("theory_researcher", theory_researcher_node)
+    workflow.add_node("waveform_viewer", waveform_viewer_node)
+
+    workflow.set_entry_point("dataset_retriever")
+    workflow.add_edge("dataset_retriever", "web_retriever")
+    workflow.add_edge("web_retriever", "code_generator")
+    workflow.add_edge("code_generator", "decomposer")
+    workflow.add_edge("decomposer", "testbench_generator")
+    workflow.add_edge("testbench_generator", "file_writer")
+    workflow.add_edge("file_writer", "simulator")
+     
+    workflow.add_edge("summarizer", "theory_researcher")
+    workflow.add_edge("theory_researcher", "waveform_viewer")
+    workflow.add_edge("waveform_viewer", END)
+
+    workflow.add_edge("module_corrector", "file_writer")
+    workflow.add_edge("testbench_corrector", "file_writer")
+     
+    workflow.add_conditional_edges(
+        "simulator",
+        check_simulation_results_node,
+        {
+            "success": "summarizer",
+            "fix_testbench": "testbench_corrector",
+            "fix_design": "module_corrector",
+            "end": END
+        }
+    )
+     
+    # The recursion limit is set during the stream/invoke call, not at compile time.
+    return workflow.compile()
+
+app = build_graph()
+
+
+# --- Part 3: Streamlit UI ---
+st.sidebar.header("Controls")
+user_query = st.sidebar.text_area("Describe the Verilog module you want to build:", height=150, value="risc v 32 bit")
+
+if st.sidebar.button("✨ Generate & Verify Code", use_container_width=True):
+    if not user_query:
+        st.sidebar.error("Please enter a description for the Verilog module.")
+    else:
+        st.subheader("🚀 Agent Workflow Visualization")
+        graph_placeholder = st.empty()
+         
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            log_expander = st.expander("Agent Activity Log", expanded=True)
+            log_container = log_expander.container()
+         
+        with col2:
+            results_expander = st.expander("Final Results & Files", expanded=True)
+            results_placeholder = results_expander.container()
+
+
+        graph_placeholder.graphviz_chart(get_graph_viz())
+        inputs = {"query": user_query, "error_count": 0, "summary": "", "theory": "", "waveform_svg": ""}
+         
+        with st.spinner("Chipster Agent is thinking... This may take a few minutes for complex designs."):
+            final_result = None
+            log_messages = []
+             
+            # Set the recursion limit for this specific run in the config.
+            config = {"recursion_limit": 100}
+            for s in app.stream(inputs, config=config, stream_mode="values"):
+                active_node = list(s.keys())[-1]
+                graph_placeholder.graphviz_chart(get_graph_viz(active_node))
+                final_result = s
+                if "log" in final_result:
+                    new_logs = final_result["log"][len(log_messages):]
+                    for msg in new_logs:
+                        log_container.markdown(f"{msg.strip()}", unsafe_allow_html=True)
+                        log_messages.append(msg)
+             
+            graph_placeholder.graphviz_chart(get_graph_viz("END"))
+             
+            results_placeholder.subheader("🏁 Final Outcome")
+            if final_result.get("simulation_output"): # Check if error output exists
+                results_placeholder.error(f"Workflow halted with an error after {final_result.get('error_count', 0)} retries.")
+                with results_placeholder.expander("🚨 View Final Simulation Error", expanded=True):
+                    st.code(final_result.get("simulation_output"), language='bash')
+            else:
+                st.balloons()
+                results_placeholder.success(f"✅ All Verilog files generated, verified, and saved to: `{final_result.get('output_path', 'N/A')}`")
+             
+            if final_result.get("summary"):
+                with results_placeholder.expander("📝 Code Summary", expanded=True):
+                    st.markdown(final_result["summary"])
+             
+            if final_result.get("theory"):
+                with results_placeholder.expander("🎓 Theory & Explanation", expanded=True):
+                    st.markdown(final_result["theory"])
+             
+            # Display Waveform if it exists
+            if final_result.get("waveform_svg"):
+                with results_placeholder.expander("📈 Waveform Visualization", expanded=True):
+                    # Display SVG directly for better rendering
+                    st.image(final_result["waveform_svg"], use_column_width=True)
+            elif not final_result.get("simulation_output"): # Only show if successful
+                 with results_placeholder.expander("📈 Waveform Visualization", expanded=True):
+                    st.warning("Waveform data was not generated. This can happen if the testbench does not properly exercise the design or if the simulation is very short.")
+
+
+            results_placeholder.write("---")
+            results_placeholder.subheader("Generated Files & Content")
+            all_files = {
+                **final_result.get("decomposed_files", {}),
+                **final_result.get("testbench_code", {})
+            }
+            if all_files:
+                # Sort files to show headers first, then top module, then others
+                sorted_files = sorted(all_files.items(), key=lambda item: (not item[0].endswith('.vh'), item[0] != f"{final_result.get('top_module_name')}.v", item[0]))
+                for filename, content in sorted_files:
+                    icon = "📄"
+                    if filename.endswith("_tb.v"):
+                        icon = "🧪"
+                    elif filename.endswith(".vh"):
+                        icon = "📚"
+                    with results_placeholder.expander(f"{icon} **{filename}**"):
+                        st.code(content, language='verilog')
+else:
+    st.info("Enter your Verilog design requirements in the sidebar and click 'Generate & Verify'.")

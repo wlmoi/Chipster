@@ -1,6 +1,7 @@
 import streamlit as st
 from src.verilog_generator import main as verilog_gen
 from src.std_cell_generator import main as std_cell_gen
+from src.chip_generator import main as chip_gen
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -45,6 +46,9 @@ def go_to_verilog():
 def go_to_std_cell():
     st.session_state.page = 'StdCell'
 
+def go_to_chip():
+    st.session_state.page = 'Chip'
+
 def go_home():
     st.session_state.page = 'Home'
 
@@ -57,18 +61,24 @@ if st.session_state.page == 'Home':
 
     st.header("Select a Tool")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("📝 Verilog Generator", use_container_width=True):
             go_to_verilog()
             st.rerun()
-        st.write("Convert natural language prompts into synthesizable Verilog and run a complete RTL-to-GDSII flow.")
+        st.write("Convert natural language prompts into synthesizable Verilog")
 
     with col2:
         if st.button("🛠️ Standard Cell Generator", use_container_width=True):
             go_to_std_cell()
             st.rerun()
         st.write("Generate physical layouts (.mag files) for standard cells from simple, high-level descriptions.")
+
+    with col3:
+        if st.button("🔧 Chip Generator", use_container_width=True):
+            go_to_chip()
+            st.rerun()
+        st.write("Design complex chips with a high-level description language and generate layouts.")
 
 elif st.session_state.page == 'Verilog':
     if st.button("⬅️ Back to Home"):
@@ -81,3 +91,9 @@ elif st.session_state.page == 'StdCell':
         go_home()
         st.rerun()
     std_cell_gen.run()
+
+elif st.session_state.page == 'Chip':
+    if st.button("⬅️ Back to Home"):
+        go_home()
+        st.rerun()
+    chip_gen.run()
