@@ -23,8 +23,8 @@ def run():
     This function contains the entire Streamlit UI and logic for the Standard Cell Generator.
     """
     # --- Configuration ---
-    FAISS_INDEX_PATH = "data/std_cell_datasets/faiss_mag_index_st"
-    GENERATED_MAG_DIR = "examples/std_cells/generated_mag_st"
+    FAISS_INDEX_PATH = "../../data/std_cell_datasets/faiss_mag_index_st"
+    GENERATED_MAG_DIR = "../../examples/std_cells/generated_mag_st"
 
     # ==============================================================================
     # VISUALIZATION LOGIC
@@ -289,3 +289,6 @@ def run():
 
     elif st.session_state.completed_cells:
         st.balloons(); st.header("🎉 Generation Complete!"); st.write("All components have been successfully generated.")
+
+if __name__ == "__main__":
+    run()
